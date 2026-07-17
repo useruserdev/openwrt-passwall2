@@ -79,6 +79,88 @@ opkg install luci-app-passwall2*.ipk
 
 ---
 
+## Xiaomi AX3200 / Redmi AX6S: защита от отката на сток
+
+Заводской загрузчик Xiaomi — двухсистемный, со счётчиком неудачных загрузок. OpenWrt эти счётчики не сбрасывает, поэтому на новых ревизиях загрузчика (2022+) примерно **на 6-й перезагрузке роутер сам откатывается на стоковую прошивку**.
+
+### Перед прошивкой (по telnet на стоке)
+
+```sh
+nvram set ssh_en=1
+nvram set uart_en=1
+nvram set boot_wait=on
+nvram set flag_boot_success=1
+nvram set flag_try_sys1_failed=0
+nvram set flag_try_sys2_failed=0
+nvram commit
+```
+
+Затем прошивка:
+
+```sh
+cd /tmp
+wget http://<ip-компьютера>:8000/factory.bin
+mtd -r write factory.bin firmware
+```
+
+### После установки OpenWrt (обязательно, один раз)
+
+```sh
+fw_setenv boot_fw1 "run boot_rd_img;bootm"
+fw_setenv flag_try_sys1_failed 8
+fw_setenv flag_try_sys2_failed 8
+fw_setenv flag_boot_rootfs 0
+fw_setenv flag_boot_success 1
+fw_setenv flag_last_success 1
+```
+
+Проверка: `fw_printenv | grep flag_try` — должно показать `flag_try_sys1_failed=8`.
+
+Альтернатива (страховка на каждый запуск) — добавить в `/etc/rc.local` до строки `exit 0`:
+
+```sh
+fw_setenv flag_try_sys1_failed 0
+fw_setenv flag_try_sys2_failed 0
+```
+
+---
+
+## AX3200: не хватает места под новые ядра (sing-box/xray)
+
+Свежие бинарники выросли: sing-box ~43 МБ, xray-core ~29 МБ, а на `/overlay` у AX6S всего ~24 МБ — через `opkg install` они **не влезают**. Решение: собрать образ через **ImageBuilder** — пакеты из образа попадают в сжатый squashfs (xray ужимается примерно до 11 МБ), а не в overlay. Ставьте только **один** core (для passwall2 достаточно xray-core, sing-box не обязателен).
+
+1. Скачайте ImageBuilder для платформы **mediatek/mt7622** с [downloads.openwrt.org](https://downloads.openwrt.org/) (свою версию OpenWrt), распакуйте.
+
+2. В `repositories.conf` добавьте прошивочные фиды passwall (архитектура AX6S — `aarch64_cortex-a53`, путь подставьте под свою версию OpenWrt, пример для 24.10):
+
+   ```
+   src/gz passwall_packages https://master.dl.sourceforge.net/project/openwrt-passwall-build/releases/packages-24.10/aarch64_cortex-a53/passwall_packages
+   src/gz passwall2 https://master.dl.sourceforge.net/project/openwrt-passwall-build/releases/packages-24.10/aarch64_cortex-a53/passwall2
+   ```
+
+3. Впеките исправленные файлы этого форка в образ через `FILES`:
+
+   ```sh
+   mkdir -p files/usr/share/passwall2 files/usr/lib/lua/luci/passwall2
+   cp <форк>/luci-app-passwall2/root/usr/share/passwall2/tasks.sh      files/usr/share/passwall2/
+   cp <форк>/luci-app-passwall2/root/usr/share/passwall2/subscribe.lua files/usr/share/passwall2/
+   cp <форк>/luci-app-passwall2/luasrc/passwall2/api.lua               files/usr/lib/lua/luci/passwall2/
+   ```
+
+4. Соберите образ (только нужное, без лишних протоколов):
+
+   ```sh
+   make image PROFILE=xiaomi_redmi-router-ax6s \
+     PACKAGES="luci luci-app-passwall2 xray-core" \
+     FILES=files
+   ```
+
+5. Прошейте полученный **sysupgrade**-образ из LuCI (System → Backup/Flash Firmware) или `sysupgrade -n`.
+
+Настройки passwall2 перед прошивкой сохраните (Backup), после — восстановите. И не забудьте про защиту от отката (раздел выше).
+
+---
+
 ## Настройка автообновления
 
 LuCI → **PassWall 2 → Node Subscribe** → выбрать подписку:
