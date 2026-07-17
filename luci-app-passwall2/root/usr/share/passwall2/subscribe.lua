@@ -1974,7 +1974,10 @@ local function curl(url, file, ua, mode, hwid)
 		curl_args[#curl_args + 1] = get_headers()
 	end
 	local return_code, result
-	if mode == "direct" then
+	if api.parse_fronting(url) then
+		-- Domain-fronting subscription (front SNI + real Host in the URL fragment)
+		return_code, result = api.curl_fronting(url, file, curl_args)
+	elseif mode == "direct" then
 		return_code, result = api.curl_direct(url, file, curl_args)
 	elseif mode == "proxy" then
 		return_code, result = api.curl_proxy(url, file, curl_args)

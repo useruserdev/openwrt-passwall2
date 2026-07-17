@@ -219,39 +219,102 @@ function curl_logic(url, file, args)
 	return return_code, result
 end
 
+-- Resolve a domain to an IPv4, trying several public resolvers as fallback.
+local function resolve_ipv4(domain)
+	return domainToIPv4(domain) or domainToIPv4(domain, "1.1.1.1") or domainToIPv4(domain, "8.8.8.8")
+end
+
+-- Run fn() with `ip` temporarily whitelisted in the psw2_direct set.
+-- While the core is running the router's own traffic is transparently redirected too,
+-- so "--resolve" alone is not enough: the resolved IP must bypass the core to reach it directly.
+local function with_direct_bypass(ip, fn)
+	local added_to_ipset = false
+	if ip then
+		if sys.call("nft list set inet passwall2 psw2_direct >/dev/null 2>&1") == 0 then
+			if sys.call("nft get element inet passwall2 psw2_direct '{ " .. ip .. " }' >/dev/null 2>&1") ~= 0 then
+				sys.call("nft add element inet passwall2 psw2_direct '{ " .. ip .. " timeout 300s }' >/dev/null 2>&1")
+			end
+		elseif sys.call("ipset -q -n list psw2_direct >/dev/null 2>&1") == 0 then
+			-- psw2_direct ipset is created without timeout support, so remove the entry after the request
+			if sys.call("ipset -q test psw2_direct " .. ip .. " >/dev/null 2>&1") ~= 0 then
+				sys.call("ipset -q add psw2_direct " .. ip .. " >/dev/null 2>&1")
+				added_to_ipset = true
+			end
+		end
+	end
+	local return_code, result = fn()
+	if added_to_ipset then
+		sys.call("ipset -q del psw2_direct " .. ip .. " >/dev/null 2>&1")
+	end
+	return return_code, result
+end
+
 function curl_direct(url, file, args)
 	-- Direct access
 	if not args then args = {} end
 	local tmp_args = clone(args)
-	local direct_ip, added_to_ipset
+	local direct_ip
 	local domain, port = get_domain_port_from_url(url)
 	if domain then
-		local ip = domainToIPv4(domain) or domainToIPv4(domain, "1.1.1.1") or domainToIPv4(domain, "8.8.8.8")
+		local ip = resolve_ipv4(domain)
 		if ip then
 			tmp_args[#tmp_args + 1] = "--resolve " .. domain .. ":" .. port .. ":" .. ip
 			direct_ip = ip
 		end
 	end
-	-- While the core is running, the router's own traffic is transparently redirected too,
-	-- so "--resolve" alone is not enough: put the resolved IP into the direct set to bypass the core.
-	if direct_ip then
-		if sys.call("nft list set inet passwall2 psw2_direct >/dev/null 2>&1") == 0 then
-			if sys.call("nft get element inet passwall2 psw2_direct '{ " .. direct_ip .. " }' >/dev/null 2>&1") ~= 0 then
-				sys.call("nft add element inet passwall2 psw2_direct '{ " .. direct_ip .. " timeout 300s }' >/dev/null 2>&1")
-			end
-		elseif sys.call("ipset -q -n list psw2_direct >/dev/null 2>&1") == 0 then
-			-- psw2_direct ipset is created without timeout support, so remove the entry after the request
-			if sys.call("ipset -q test psw2_direct " .. direct_ip .. " >/dev/null 2>&1") ~= 0 then
-				sys.call("ipset -q add psw2_direct " .. direct_ip .. " >/dev/null 2>&1")
-				added_to_ipset = true
-			end
+	return with_direct_bypass(direct_ip, function() return curl_base(url, file, tmp_args) end)
+end
+
+-- Detect a domain-fronting subscription URL.
+-- The fronting parameters are carried in the URL fragment, e.g.
+--   https://www.google.com/sub/TOKEN#?resolve-address=www.google.com&host=zeus-xxx.run.app
+-- where the URL host is the TLS/SNI front and `host` is the real backend Host header.
+-- Returns { url = <base url without fragment>, host_header = <Host>, resolve = <addr> } or nil.
+function parse_fronting(url)
+	if not url then return nil end
+	local base, frag = url:match("^([^#]*)#(.*)$")
+	if not frag then return nil end
+	frag = frag:gsub("^%?", "")
+	local params = {}
+	for k, v in frag:gmatch("([^&=]+)=([^&]*)") do
+		params[k:lower()] = UrlDecode(v)
+	end
+	local host_header = params["host"]
+	local resolve = params["resolve-address"] or params["resolveaddress"]
+	if not host_header and not resolve then return nil end
+	return { url = base, host_header = host_header, resolve = resolve }
+end
+
+-- Fetch a domain-fronting subscription: TLS/SNI uses the URL host (front),
+-- while the HTTP Host header is overridden with the real backend.
+function curl_fronting(url, file, args)
+	local front = parse_fronting(url)
+	if not front then return curl_auto(url, file, args) end
+	if not args then args = {} end
+	local tmp_args = clone(args)
+	local base_url = front.url
+	local domain, port = get_domain_port_from_url(base_url)
+	port = port or 443
+	if front.host_header and front.host_header ~= "" then
+		tmp_args[#tmp_args + 1] = '-H "Host: ' .. front.host_header .. '"'
+	end
+	-- Pick the IP to connect to: the resolve-address (front), falling back to the URL host.
+	local ip
+	if front.resolve and front.resolve ~= "" then
+		if datatypes.ipaddr(front.resolve) or datatypes.ip6addr(front.resolve) then
+			ip = front.resolve
+		else
+			ip = resolve_ipv4(front.resolve)
 		end
 	end
-	local return_code, result = curl_base(url, file, tmp_args)
-	if added_to_ipset then
-		sys.call("ipset -q del psw2_direct " .. direct_ip .. " >/dev/null 2>&1")
+	if not ip and domain then
+		ip = resolve_ipv4(domain)
 	end
-	return return_code, result
+	if domain and ip then
+		-- SNI stays the URL host (front); traffic is directed to the resolved IP.
+		tmp_args[#tmp_args + 1] = "--resolve " .. domain .. ":" .. port .. ":" .. ip
+	end
+	return with_direct_bypass(ip, function() return curl_base(base_url, file, tmp_args) end)
 end
 
 function curl_auto(url, file, args)
