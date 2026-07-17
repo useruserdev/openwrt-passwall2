@@ -223,27 +223,50 @@ function curl_direct(url, file, args)
 	-- Direct access
 	if not args then args = {} end
 	local tmp_args = clone(args)
+	local direct_ip, added_to_ipset
 	local domain, port = get_domain_port_from_url(url)
 	if domain then
-		local ip = domainToIPv4(domain)
+		local ip = domainToIPv4(domain) or domainToIPv4(domain, "1.1.1.1") or domainToIPv4(domain, "8.8.8.8")
 		if ip then
 			tmp_args[#tmp_args + 1] = "--resolve " .. domain .. ":" .. port .. ":" .. ip
+			direct_ip = ip
 		end
 	end
-	return curl_base(url, file, tmp_args)
+	-- While the core is running, the router's own traffic is transparently redirected too,
+	-- so "--resolve" alone is not enough: put the resolved IP into the direct set to bypass the core.
+	if direct_ip then
+		if sys.call("nft list set inet passwall2 psw2_direct >/dev/null 2>&1") == 0 then
+			if sys.call("nft get element inet passwall2 psw2_direct '{ " .. direct_ip .. " }' >/dev/null 2>&1") ~= 0 then
+				sys.call("nft add element inet passwall2 psw2_direct '{ " .. direct_ip .. " timeout 300s }' >/dev/null 2>&1")
+			end
+		elseif sys.call("ipset -q -n list psw2_direct >/dev/null 2>&1") == 0 then
+			-- psw2_direct ipset is created without timeout support, so remove the entry after the request
+			if sys.call("ipset -q test psw2_direct " .. direct_ip .. " >/dev/null 2>&1") ~= 0 then
+				sys.call("ipset -q add psw2_direct " .. direct_ip .. " >/dev/null 2>&1")
+				added_to_ipset = true
+			end
+		end
+	end
+	local return_code, result = curl_base(url, file, tmp_args)
+	if added_to_ipset then
+		sys.call("ipset -q del psw2_direct " .. direct_ip .. " >/dev/null 2>&1")
+	end
+	return return_code, result
 end
 
 function curl_auto(url, file, args)
 	local localhost_proxy = uci:get(appname, "@global[0]", "localhost_proxy") or "1"
+	local return_code, result
 	if localhost_proxy == "1" then
-		return curl_base(url, file, args)
+		return_code, result = curl_base(url, file, args)
 	else
-		local return_code, result = curl_proxy(url, file, args)
-		if not return_code or return_code ~= 0 then
-			return_code, result = curl_direct(url, file, args)
-		end
-		return return_code, result
+		return_code, result = curl_proxy(url, file, args)
 	end
+	-- Fallback: if fetching through the (possibly dead) proxy failed, retry with a direct connection
+	if not return_code or return_code ~= 0 then
+		return_code, result = curl_direct(url, file, args)
+	end
+	return return_code, result
 end
 
 function url(...)

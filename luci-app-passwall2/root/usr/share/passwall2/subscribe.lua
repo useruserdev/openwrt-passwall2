@@ -2482,6 +2482,10 @@ local execute = function()
 			local cfgid = value[".name"]
 			local remark = value.remark or ""
 			local url = value.url or ""
+			-- Loop mode (tasks.sh) schedules the next update relative to this timestamp
+			if cfgid then
+				uci:set(appname, cfgid, "last_update", tostring(os.time()))
+			end
 
 			local url_is_local
 			if fs.access(url) then
